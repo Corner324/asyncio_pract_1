@@ -1,25 +1,16 @@
-import asyncio
 import logging
 import os
 import time
 from datetime import date, datetime
 from typing import List, Optional, Tuple
-
-import aiohttp
 import pandas as pd
 import requests
 from bs4 import BeautifulSoup
-from database import async_engine, SyncSession
+from database import SyncSession
 from models import SpimexTradingResult
 from pydantic import BaseModel, Field, computed_field
 from sqlalchemy.dialects.postgresql import insert
-from sqlalchemy.ext.asyncio import async_sessionmaker
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s",
-    handlers=[logging.FileHandler("spimex_parser.log", encoding="utf-8"), logging.StreamHandler()],
-)
 logger = logging.getLogger(__name__)
 
 
@@ -50,47 +41,12 @@ class TradingResultModel(BaseModel):
         return self.exchange_product_id[-1]
 
 
-async def get_max_pages(base_url: str, headers: dict) -> int:
-    """Получает максимальное количество страниц пагинации."""
-    async with aiohttp.ClientSession(headers=headers) as session:
-        try:
-            async with session.get(base_url) as response:
-                response.raise_for_status()
-                soup = BeautifulSoup(await response.text(), "html.parser")
-                pagination = soup.find("div", class_="bx-pagination-container")
-                if not pagination:
-                    return 1
-                pages = pagination.find_all("li")
-                if not pages:
-                    return 1
-                last_page = pages[-2].text.strip()  # Предпоследний <li> перед "Вперед"
-                return int(last_page) if last_page.isdigit() else 1
-        except aiohttp.ClientError as e:
-            logger.error(f"Ошибка при определении количества страниц: {e}")
-            return 1
-
-
-async def fetch_page(page_url: str, headers: dict, retries: int = 3, delay: float = 2.0) -> Optional[str]:
-    """Загружает страницу с ретраями."""
-    async with aiohttp.ClientSession(headers=headers) as session:
-        for attempt in range(retries):
-            try:
-                async with session.get(page_url) as response:
-                    response.raise_for_status()
-                    return await response.text()
-            except aiohttp.ClientError as e:
-                logger.warning(f"Попытка {attempt + 1} не удалась для {page_url}: {e}")
-                if attempt < retries - 1:
-                    await asyncio.sleep(delay)
-        logger.error(f"Не удалось загрузить страницу {page_url} после {retries} попыток")
-        return None
-
-
 def parse_page_links(soup: BeautifulSoup, start_date: date, end_date: date, base_url: str) -> List[Tuple[str, date]]:
     """Парсит ссылки на бюллетени с одной страницы."""
+    start_time = time.time()
     bulletin_urls = []
     links = soup.find_all("a", class_="accordeon-inner__item-title link xls")
-    logger.info(f"Найдено {len(links)} ссылок на странице")
+    logger.info(f"Найдено {len(links)} ссылок на странице за {time.time() - start_time:.2f} секунд")
 
     for link in links:
         href = link.get("href")
@@ -118,69 +74,20 @@ def parse_page_links(soup: BeautifulSoup, start_date: date, end_date: date, base
     return bulletin_urls
 
 
-async def get_bulletin_urls(start_date: date, end_date: date) -> List[Tuple[str, date]]:
-    """Собирает URL бюллетеней за указанный период с учетом пагинации."""
-    base_url = "https://spimex.com/markets/oil_products/trades/results/"
-    bulletin_urls = []
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
-    }
-
-    max_pages = await get_max_pages(base_url, headers)
-    logger.info(f"Найдено {max_pages} страниц пагинации")
-
-    for page in range(1, max_pages + 1):
-        page_url = f"{base_url}?page=page-{page}" if page > 1 else base_url
-        logger.info(f"Обрабатывается страница {page}: {page_url}")
-
-        html = await fetch_page(page_url, headers)
-        if not html:
-            continue
-
-        soup = BeautifulSoup(html, "html.parser")
-        page_urls = parse_page_links(soup, start_date, end_date, base_url)
-        bulletin_urls.extend(page_urls)
-
-        if page_urls:
-            earliest_date = min(date for _, date in page_urls)
-            if earliest_date < date(2023, 1, 1):
-                logger.info("Достигнута страница с данными до 2023 года, завершаем сбор")
-                break
-
-        pagination = soup.find("div", class_="bx-pagination-container")
-        if pagination:
-            next_page = pagination.find("li", class_="bx-pag-next")
-            if not next_page or not next_page.find("a"):
-                logger.info("Достигнута последняя страница пагинации")
-                break
-
-    logger.info(f"Всего найдено {len(bulletin_urls)} подходящих бюллетеней")
-    return bulletin_urls
-
-
-async def download_bulletin(url: str, output_path: str) -> bool:
-    """Загружает бюллетень по указанному URL асинхронно."""
-    try:
-        if os.path.exists(output_path):
-            logger.info(f"Файл {output_path} уже существует, пропускаем загрузку")
-            return True
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url) as response:
-                response.raise_for_status()
-                with open(output_path, "wb") as f:
-                    f.write(await response.read())
-                logger.info(f"Бюллетень загружен: {output_path}")
-                return True
-    except aiohttp.ClientError as e:
-        logger.error(f"Ошибка при загрузке бюллетеня {url}: {e}")
-        return False
-
-
 def parse_bulletin(file_path: str, trade_date: date) -> List[dict]:
-    """Парсит Excel-бюллетень и возвращает список словарей."""
+    start_time = time.time()
     try:
-        df = pd.read_excel(file_path, sheet_name=0, header=None)
+        # Проверка только расширения файла
+        if not file_path.lower().endswith(".xls"):
+            logger.error(f"Файл {file_path} не имеет расширение .xls")
+            return []
+
+        # Чтение файла через pandas
+        try:
+            df = pd.read_excel(file_path, sheet_name=0, header=None)
+        except Exception as e:
+            logger.error(f"Не удалось открыть файл {file_path} как Excel: {e}")
+            return []
 
         if len(df) <= 6:
             logger.error(f"Файл {file_path} слишком короткий, нет строки с заголовками")
@@ -221,9 +128,12 @@ def parse_bulletin(file_path: str, trade_date: date) -> List[dict]:
             data_df[col] = data_df[col].replace("-", pd.NA)
             data_df[col] = pd.to_numeric(data_df[col], errors="coerce").fillna(0)
 
+        logger.debug(f"До фильтрации: {len(data_df)} строк")
         data_df = data_df[data_df["Количество Договоров, шт."] > 0]
+        logger.debug(f"После фильтрации 'Количество Договоров, шт.' > 0: {len(data_df)} строк")
         data_df = data_df[list(required_columns.keys())]
         data_df = data_df[~data_df["Код Инструмента"].str.contains("Итог", case=False, na=False)]
+        logger.debug(f"После фильтрации 'Итог': {len(data_df)} строк")
 
         current_time = pd.to_datetime(datetime.now())
         data_df["date"] = trade_date
@@ -236,58 +146,20 @@ def parse_bulletin(file_path: str, trade_date: date) -> List[dict]:
         records = adapter.validate_python(data_df.to_dict(orient="records"))
 
         result = [record.dict(by_alias=False) for record in records]
-        logger.info(f"Спарсено {len(result)} записей из {file_path}")
+        logger.info(f"Спарсено {len(result)} записей из {file_path} за {time.time() - start_time:.2f} секунд")
         return result
     except Exception as e:
         logger.error(f"Ошибка при парсинге {file_path}: {e}")
         return []
 
 
-async def save_batch(batch: List[dict]) -> None:
-    """Сохраняет один батч данных в базу данных с отдельной сессией."""
-    async with async_sessionmaker(async_engine)() as session:
-        try:
-            stmt = insert(SpimexTradingResult).values(batch).on_conflict_do_nothing()
-            await session.execute(stmt)
-            await session.commit()
-            logger.info(f"Сохранен батч из {len(batch)} записей")
-        except Exception as e:
-            logger.error(f"Ошибка при сохранении батча: {e}")
-            await session.rollback()
-
-
-async def process_bulletins_async(start_date: date, end_date: date, output_dir: str = "bulletins") -> None:
-    """Обрабатывает бюллетени за указанный период асинхронно."""
-    os.makedirs(output_dir, exist_ok=True)
-
-    bulletin_urls = await get_bulletin_urls(start_date, end_date)
-    all_records = []
-
-    for url, trade_date in bulletin_urls:
-        output_path = os.path.join(output_dir, f"oil_xls_{trade_date.strftime('%Y%m%d')}.xls")
-        if await download_bulletin(url, output_path):
-            records = parse_bulletin(output_path, trade_date)
-            all_records.extend(records)
-
-    if not all_records:
-        logger.info("Нет данных для сохранения в базу")
-        return
-
-    batch_size = 1000
-    batches = [all_records[i : i + batch_size] for i in range(0, len(all_records), batch_size)]
-
-    tasks = [save_batch(batch) for batch in batches]
-    await asyncio.gather(*tasks)
-
-    logger.info(f"Сохранено {len(all_records)} записей в {len(batches)} параллельных батчах")
-
-
 def process_bulletins_sync(start_date: date, end_date: date, output_dir: str = "bulletins") -> None:
     """Обрабатывает бюллетени за указанный период синхронно."""
+    start_time = time.time()
 
     def sync_get_max_pages(base_url: str, headers: dict) -> int:
         try:
-            response = requests.get(base_url, headers=headers)
+            response = requests.get(base_url, headers=headers, timeout=10)
             response.raise_for_status()
             soup = BeautifulSoup(response.text, "html.parser")
             pagination = soup.find("div", class_="bx-pagination-container")
@@ -302,11 +174,12 @@ def process_bulletins_sync(start_date: date, end_date: date, output_dir: str = "
             logger.error(f"Ошибка при определении количества страниц: {e}")
             return 1
 
-    def sync_fetch_page(page_url: str, headers: dict, retries: int = 3, delay: float = 2.0) -> Optional[str]:
+    def sync_fetch_page(page_url: str, headers: dict, retries: int = 5, delay: float = 5.0) -> Optional[str]:
         for attempt in range(retries):
             try:
-                response = requests.get(page_url, headers=headers)
+                response = requests.get(page_url, headers=headers, timeout=10)
                 response.raise_for_status()
+                time.sleep(0.5)
                 return response.text
             except requests.RequestException as e:
                 logger.warning(f"Попытка {attempt + 1} не удалась для {page_url}: {e}")
@@ -355,6 +228,10 @@ def process_bulletins_sync(start_date: date, end_date: date, output_dir: str = "
         return bulletin_urls
 
     os.makedirs(output_dir, exist_ok=True)
+    if end_date > date.today():
+        logger.warning(f"Конец диапазона дат ({end_date}) в будущем, устанавливаем текущую дату")
+        end_date = date.today()
+
     bulletin_urls = sync_get_bulletin_urls(start_date, end_date)
     all_records = []
 
@@ -364,7 +241,8 @@ def process_bulletins_sync(start_date: date, end_date: date, output_dir: str = "
             if os.path.exists(output_path):
                 logger.info(f"Файл {output_path} уже существует, пропускаем загрузку")
             else:
-                response = requests.get(url)
+                response = requests.get(url, timeout=10)
+                content_type = response.headers.get("Content-Type", "")
                 response.raise_for_status()
                 with open(output_path, "wb") as f:
                     f.write(response.content)
@@ -392,27 +270,12 @@ def process_bulletins_sync(start_date: date, end_date: date, output_dir: str = "
                 logger.error(f"Ошибка при сохранении батча: {e}")
                 session.rollback()
 
-    logger.info(f"Сохранено {len(all_records)} записей в {len(batches)} батчах")
-
-
-def compare_execution_time(start_date: date, end_date: date, output_dir: str = "bulletins") -> None:
-    """Сравнивает время выполнения синхронного и асинхронного кода."""
-    logger.info("Запуск синхронной версии...")
-    start_time = time.time()
-    process_bulletins_sync(start_date, end_date, output_dir)
-    sync_duration = time.time() - start_time
-
-    logger.info("Запуск асинхронной версии...")
-    start_time = time.time()
-    asyncio.run(process_bulletins_async(start_date, end_date, output_dir))
-    async_duration = time.time() - start_time
-
-    logger.info(f"Синхронное выполнение: {sync_duration:.2f} секунд")
-    logger.info(f"Асинхронное выполнение: {async_duration:.2f} секунд")
-    logger.info(f"Асинхронный код быстрее на {sync_duration - async_duration:.2f} секунд")
+    logger.info(
+        f"Сохранено {len(all_records)} записей в {len(batches)} батчах за {time.time() - start_time:.2f} секунд"
+    )
 
 
 if __name__ == "__main__":
     start_date = date(2023, 4, 22)
-    end_date = date(2025, 5, 27)
-    compare_execution_time(start_date, end_date)
+    end_date = date(2023, 4, 30)
+    process_bulletins_sync(start_date, end_date)
