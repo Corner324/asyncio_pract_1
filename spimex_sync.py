@@ -8,37 +8,10 @@ import requests
 from bs4 import BeautifulSoup
 from database import SyncSession
 from models import SpimexTradingResult
-from pydantic import BaseModel, Field, computed_field
+from trading_result_schema import TradingResultModel
 from sqlalchemy.dialects.postgresql import insert
 
 logger = logging.getLogger(__name__)
-
-
-class TradingResultModel(BaseModel):
-    exchange_product_id: str = Field(..., alias="Код Инструмента")
-    exchange_product_name: str = Field(..., alias="Наименование Инструмента")
-    delivery_basis_name: str = Field(..., alias="Базис поставки")
-    volume: float = Field(..., alias="Объем Договоров в единицах измерения")
-    total: float = Field(..., alias="Обьем Договоров, руб.")
-    count: int = Field(..., alias="Количество Договоров, шт.")
-    date: date
-    created_on: datetime
-    updated_on: datetime
-
-    @computed_field
-    @property
-    def oil_id(self) -> str:
-        return self.exchange_product_id[:4]
-
-    @computed_field
-    @property
-    def delivery_basis_id(self) -> str:
-        return self.exchange_product_id[4:7]
-
-    @computed_field
-    @property
-    def delivery_type_id(self) -> str:
-        return self.exchange_product_id[-1]
 
 
 def parse_page_links(soup: BeautifulSoup, start_date: date, end_date: date, base_url: str) -> List[Tuple[str, date]]:
