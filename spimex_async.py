@@ -241,18 +241,14 @@ async def download_bulletin(url: str, output_path: str) -> bool:
         return False
 
 
-async def save_batch(batch: List[dict]) -> None:
-    """Сохраняет один батч данных в базу данных с отдельной сессией."""
-    start_time = time.time()
-    async with async_sessionmaker(async_engine)() as session:
-        try:
-            stmt = insert(SpimexTradingResult).values(batch).on_conflict_do_nothing()
-            await session.execute(stmt)
-            await session.commit()
-            logger.info(f"Сохранен батч из {len(batch)} записей за {time.time() - start_time:.2f} секунд")
-        except Exception as e:
-            logger.error(f"Ошибка при сохранении батча: {e}")
-            await session.rollback()
+async def save_batch(session, batch: List[dict]) -> None:
+    """Выполняет вставку одного батча данных в базу данных."""
+    try:
+        stmt = insert(SpimexTradingResult).values(batch).on_conflict_do_nothing()
+        await session.execute(stmt)
+    except Exception as e:
+        logger.error(f"Ошибка при вставке батча из {len(batch)} записей: {e}")
+        raise
 
 
 async def process_bulletins_async(start_date: date, end_date: date, output_dir: str = "bulletins") -> None:
@@ -289,12 +285,25 @@ async def process_bulletins_async(start_date: date, end_date: date, output_dir: 
     batch_size = 1000
     batches = [all_records[i : i + batch_size] for i in range(0, len(all_records), batch_size)]
 
-    for batch in batches:
-        await save_batch(batch)
+    # Параллельное сохранение батчей
+    async with async_sessionmaker(async_engine)() as session:
+        try:
+            start_batch_time = time.time()
 
-    logger.info(
-        f"Сохранено {len(all_records)} записей в {len(batches)} батчах за {time.time() - start_time:.2f} секунд"
-    )
+            insert_tasks = [save_batch(session, batch) for batch in batches]
+
+            await asyncio.gather(*insert_tasks)
+
+            await session.commit()
+            logger.info(
+                f"Сохранено {len(all_records)} записей в {len(batches)} батчах за "
+                f"{time.time() - start_batch_time:.2f} секунд"
+            )
+        except Exception as e:
+            logger.error(f"Ошибка при сохранении батчей: {e}")
+            await session.rollback()
+
+    logger.info(f"Обработка завершена: сохранено {len(all_records)} записей за {time.time() - start_time:.2f} секунд")
 
 
 if __name__ == "__main__":

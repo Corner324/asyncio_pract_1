@@ -1,7 +1,6 @@
 import logging
 
 from config import DB_HOST, DB_NAME, DB_PASS, DB_PORT, DB_USER
-from models import BaseModel
 from sqlalchemy import create_engine
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import sessionmaker
@@ -19,8 +18,6 @@ ASYNC_DATABASE_URL = f"postgresql+asyncpg://{DB_USER}:{DB_PASS}@{DB_HOST}:{DB_PO
 try:
     # Синхронный движок для создания таблиц и синхронных операций
     sync_engine = create_engine(SYNC_DATABASE_URL, pool_pre_ping=True)
-    BaseModel.metadata.create_all(sync_engine, checkfirst=True)
-    logger.info("Таблицы созданы или уже существуют")
 
     # Асинхронный движок для асинхронных операций
     async_engine = create_async_engine(ASYNC_DATABASE_URL, echo=False)
